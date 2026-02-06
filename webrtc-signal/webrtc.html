@@ -1,0 +1,175 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebRTC DataChannel Ping (2 tabs)</title>
+  <style>
+    body { font-family: sans-serif; margin: 16px; }
+    #log { white-space: pre-wrap; background: #111; color: #eee; padding: 12px; border-radius: 8px; }
+    input, button { font-size: 14px; padding: 6px 10px; }
+  </style>
+</head>
+<body>
+  <h2>WebRTC DataChannel Ping (open in two tabs)</h2>
+
+  <div>
+    Room: <input id="room" value="demo" />
+    <button id="start">Start</button>
+  </div>
+
+  <p>Status: <span id="status">idle</span></p>
+  <div id="log"></div>
+
+<script>
+const logEl = document.getElementById("log");
+const statusEl = document.getElementById("status");
+const roomEl = document.getElementById("room");
+const startBtn = document.getElementById("start");
+
+function log(...args) {
+  const line = args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+  console.log(line);
+  logEl.textContent += line + "\n";
+}
+
+let ws, pc, dc;
+let isPolite = false;       // glare handling: one tab will act "polite"
+let makingOffer = false;
+let ignoreOffer = false;
+
+async function start() {
+  startBtn.disabled = true;
+  const room = roomEl.value.trim();
+  if (!room) return;
+
+  // Basic "polite peer" selection: first tab you start -> likely different timing; good enough for demo.
+  // You can force one tab to be polite by appending ?polite=1 to the URL.
+  isPolite = new URLSearchParams(location.search).get("polite") === "1";
+  log("polite:", isPolite);
+
+  // WebSocket signaling
+  ws = new WebSocket(`ws://127.0.0.1:8080/ws/${encodeURIComponent(room)}`);
+  ws.onopen = () => log("ws: connected");
+  ws.onerror = (e) => log("ws error:", e);
+  ws.onclose = () => log("ws: closed");
+
+  // PeerConnection (no STUN for same-machine demo; add STUN below if you want)
+  pc = new RTCPeerConnection({
+    // For cross-network tests, uncomment:
+    // iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  });
+
+  pc.oniceconnectionstatechange = () => log("iceConnectionState:", pc.iceConnectionState);
+  pc.onconnectionstatechange = () => {
+    statusEl.textContent = pc.connectionState;
+    log("connectionState:", pc.connectionState);
+  };
+  pc.onsignalingstatechange = () => log("signalingState:", pc.signalingState);
+
+  pc.onicecandidate = ({ candidate }) => {
+    if (candidate) {
+      ws.send(JSON.stringify({ type: "candidate", payload: candidate }));
+    }
+  };
+
+  pc.ondatachannel = (ev) => {
+    log("got remote datachannel:", ev.channel.label);
+    dc = ev.channel;
+    setupDataChannel();
+  };
+
+  // Perfect negotiation-ish (minimal)
+  pc.onnegotiationneeded = async () => {
+    try {
+      makingOffer = true;
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({ type: "offer", payload: pc.localDescription }));
+      log("sent offer");
+    } catch (e) {
+      log("negotiation error:", e);
+    } finally {
+      makingOffer = false;
+    }
+  };
+
+  ws.onmessage = async (ev) => {
+    const msg = JSON.parse(ev.data);
+    const type = msg.type;
+    const payload = msg.payload;
+
+    // NOTE: server currently broadcasts to everyone in room, including self.
+    // Ignore self-sent messages by checking if payload matches our local description.
+    // Simple approach: if it's an offer/answer and we already have same sdp set, drop it.
+    if ((type === "offer" || type === "answer") && payload?.sdp && pc.localDescription?.sdp === payload.sdp) {
+      return;
+    }
+
+    try {
+      if (type === "offer") {
+        const offerCollision = makingOffer || pc.signalingState !== "stable";
+        ignoreOffer = !isPolite && offerCollision;
+        if (ignoreOffer) {
+          log("ignored offer (glare, impolite)");
+          return;
+        }
+        await pc.setRemoteDescription(payload);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: "answer", payload: pc.localDescription }));
+        log("received offer -> sent answer");
+      } else if (type === "answer") {
+        await pc.setRemoteDescription(payload);
+        log("received answer");
+      } else if (type === "candidate") {
+        try {
+          await pc.addIceCandidate(payload);
+        } catch (e) {
+          if (!ignoreOffer) throw e;
+        }
+      }
+    } catch (e) {
+      log("signal handling error:", e);
+    }
+  };
+
+  // Create a data channel on this side too.
+  // (Both sides creating is okay; remote will also receive ondatachannel.)
+  dc = pc.createDataChannel("ping");
+  setupDataChannel();
+}
+
+function setupDataChannel() {
+  if (!dc) return;
+
+  dc.onopen = () => {
+    log("dc open:", dc.label);
+    // Ping loop
+    setInterval(() => {
+      if (dc.readyState !== "open") return;
+      const ts = performance.now();
+      dc.send("ping:" + ts.toFixed(3));
+    }, 1000);
+  };
+
+  dc.onmessage = (ev) => {
+    const s = String(ev.data);
+    if (s.startsWith("ping:")) {
+      dc.send("pong:" + s.slice(5));
+    } else if (s.startsWith("pong:")) {
+      const sent = parseFloat(s.slice(5));
+      const rtt = performance.now() - sent;
+      log("RTT ms:", rtt.toFixed(1));
+    } else {
+      log("msg:", s);
+    }
+  };
+
+  dc.onclose = () => log("dc closed");
+  dc.onerror = (e) => log("dc error:", e);
+}
+
+startBtn.onclick = start;
+</script>
+</body>
+</html>
